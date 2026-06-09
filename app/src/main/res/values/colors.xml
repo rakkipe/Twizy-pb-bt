@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary teal palette -->
+    <color name="colorPrimary">#00897B</color>
+    <color name="colorPrimaryDark">#00695C</color>
+    <color name="colorPrimaryLight">#80CBC4</color>
+    <color name="colorAccent">#FF8F00</color>
+    <color name="colorGreen">#43A047</color>
+
+    <!-- Backgrounds -->
+    <color name="background">#121212</color>
+    <color name="card_background">#1E1E1E</color>
+    <color name="progress_background">#3A3A3A</color>
+
+    <!-- Text -->
+    <color name="text_primary">#EFEFEF</color>
+    <color name="text_secondary">#9E9E9E</color>
+    <color name="white">#FFFFFF</color>
+
+    <!-- Status bar -->
+    <color name="statusBarColor">#004D40</color>
+</resources>
