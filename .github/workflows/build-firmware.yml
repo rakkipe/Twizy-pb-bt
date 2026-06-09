@@ -1,0 +1,46 @@
+name: Build M5StickC Plus2 Firmware
+
+on:
+  push:
+    branches:
+      - claude/android-app-mobile-build-nw2904
+    paths:
+      - 'firmware/**'
+  pull_request:
+    branches:
+      - claude/android-app-mobile-build-nw2904
+    paths:
+      - 'firmware/**'
+
+jobs:
+  build:
+    name: Compile firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('firmware/platformio.ini') }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        working-directory: firmware
+        run: pio run
+
+      - name: Upload firmware binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: TwizyPB-firmware.bin
+          path: firmware/.pio/build/m5stick-c-plus2/firmware.bin
+          if-no-files-found: error
