@@ -1,134 +1,165 @@
 #include <M5Unified.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+#include <driver/twai.h>   // ESP32 ingebouwde CAN-controller (TWAI)
 
 // =============================================================
-//  CONFIGURATIE — pas hier aan voor jouw hardware
+//  CONFIGURATIE
 // =============================================================
 
-#define DEVICE_NAME  "TwizyPB"   // BLE naam die de app ziet
+#define DEVICE_NAME  "TwizyPB"
 
-// --- Sensor modus (kies er één) ---
-#define MODE_DEMO    0   // Gesimuleerde testwaarden (standaard)
-#define MODE_INA226  1   // INA226 via I2C op Grove-poort
-#define MODE_ADC     2   // Spanningsdeler op ADC + ACS712/758
+// --- Modus ---
+#define MODE_CAN   0   // Renault Twizy CAN-bus (standaard)
+#define MODE_DEMO  1   // Gesimuleerde testdata (geen hardware nodig)
 
-#define SENSOR_MODE  MODE_DEMO
+#define SENSOR_MODE  MODE_CAN
 
-// --- INA226 instellingen (alleen bij MODE_INA226) ---
-// Sluit aan op Grove: SDA=G32, SCL=G33
-// #define INA226_ADDR   0x40
-// #define INA226_SHUNT  0.01f   // Shunt weerstand in Ohm (bv. 10mΩ)
-// #define VOLT_SCALE    1.0f    // Correctiefactor spanning (1.0 = geen correctie)
+// --- CAN pinnen ---
+// M5Stack CAN Unit op Grove-poort: TX=G32, RX=G33
+// Of eigen SN65HVD230/TJA1050 module
+#define CAN_TX_PIN  GPIO_NUM_32
+#define CAN_RX_PIN  GPIO_NUM_33
 
-// --- ADC instellingen (alleen bij MODE_ADC) ---
-// Spanning: spanningsdeler op GPIO36
-//   R1=100kΩ (naar batterij+), R2=5.6kΩ (naar GND)
-//   Ratio = (R1+R2)/R2 ≈ 18.86 → voor 58V: 58/18.86 = 3.07V op ADC
-// #define VOLT_PIN      36
-// #define VOLT_RATIO    18.86f
-// Stroom: ACS758 50B (40mV/A) op GPIO35
-// #define CURR_PIN      35
-// #define CURR_SENS     40.0f   // mV per Ampère
-// #define CURR_OFFSET   1.65f   // Nulpunt spanning in V (halve VCC)
+// --- GPIO voor relais (pas aan naar jouw bedrading) ---
+#define RELAY1_PIN  26
+#define RELAY2_PIN  0
 
-// --- GPIO voor relais ---
-#define RELAY1_PIN  26   // Grove TX pin (of extern relais module)
-#define RELAY2_PIN  0    // Pas aan naar jouw GPIO
+// =============================================================
+//  TWIZY CAN FRAME IDs
+//  Bron: OVMS project + community reverse engineering
+//  500 kbps, standaard 11-bit identifiers
+// =============================================================
 
-// --- Batterijcapaciteit Twizy (voor SoC berekening) ---
-#define BATT_FULL_V   58.8f   // Volledig geladen (V)
-#define BATT_EMPTY_V  48.0f   // Leeg (V)
+// 0x424  — SoC, laadstatus (elke ~100ms)
+//   byte 0 bits[5:0] = SoC 0-100%
+//   byte 0 bit[6]    = ready (contactsleutel aan)
+//   byte 0 bit[7]    = fout
+#define CAN_ID_SOC      0x424
+
+// 0x155  — Rijsnelheid (elke ~10ms)
+//   bytes[0:1] bits[11:0] = snelheid in 0.01 m/s
+#define CAN_ID_SPEED    0x155
+
+// 0x59E  — Batterijspanning + stroom (elke ~100ms)
+//   bytes[0:1] int16 big-endian = stroom in 0.25A (negatief = ontladen)
+//   bytes[2:3] uint16 big-endian = spanning in 0.5V
+//
+//   OPMERKING: byte-volgorde varieert per bouwjaar.
+//   Gebruik de sniffer hieronder (zie Serial output) om te verifiëren.
+#define CAN_ID_BATT     0x59E
+
+// 0x3F2  — Batterijtemperatuur (optioneel)
+//   byte 0 = temperatuur in °C + 40 offset
+#define CAN_ID_TEMP     0x3F2
 
 // =============================================================
 
-// NUS UUIDs (Nordic UART Service)
+// NUS UUIDs (Nordic UART Service — zelfde als Android app)
 #define NUS_SERVICE  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_CHAR  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX_CHAR  "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// --- Staat ---
+// --- Globale staat ---
 static float    gVoltage = 0, gCurrent = 0, gPower = 0;
 static int      gSoc = 0;
+static float    gSpeed = 0;
+static int      gTemp = 0;
+static bool     gReady = false;
 static bool     gRelay1 = false, gRelay2 = false;
-static bool     gConnected = false;
+static bool     gBleConnected = false;
+static bool     gCanOk = false;
 static uint32_t gLastSend = 0;
+static uint32_t gLastCanMsg = 0;
 
-static NimBLEServer*         pServer = nullptr;
-static NimBLECharacteristic* pTxChar = nullptr;
-
-// =============================================================
-//  INA226 minimale implementatie (geen extra lib nodig)
-// =============================================================
-#if SENSOR_MODE == MODE_INA226
-#include <Wire.h>
-
-static void ina226_write(uint8_t addr, uint8_t reg, uint16_t val) {
-    Wire.beginTransmission(addr);
-    Wire.write(reg);
-    Wire.write(val >> 8);
-    Wire.write(val & 0xFF);
-    Wire.endTransmission();
-}
-
-static uint16_t ina226_read(uint8_t addr, uint8_t reg) {
-    Wire.beginTransmission(addr);
-    Wire.write(reg);
-    Wire.endTransmission(false);
-    Wire.requestFrom((uint8_t)addr, (uint8_t)2);
-    return ((uint16_t)Wire.read() << 8) | Wire.read();
-}
-
-static void ina226_init() {
-    Wire.begin(32, 33);   // Grove SDA=G32, SCL=G33
-    // Config: gemiddeld 16x, 1.1ms conversie, continu
-    ina226_write(INA226_ADDR, 0x00, 0x4727);
-    // Kalibratie voor 10mΩ shunt, max 10A:
-    // Cal = 0.00512 / (CurrentLSB * Rshunt)
-    // CurrentLSB = 10A / 32768 = 305µA
-    ina226_write(INA226_ADDR, 0x05, 1677);
-}
-
-static void ina226_read_all() {
-    int16_t raw_v = (int16_t)ina226_read(INA226_ADDR, 0x02);
-    int16_t raw_i = (int16_t)ina226_read(INA226_ADDR, 0x04);
-    gVoltage = raw_v * 1.25f / 1000.0f * VOLT_SCALE;  // 1.25mV/bit
-    gCurrent = raw_i * 305e-6f;                         // 305µA/bit
-    gPower   = gVoltage * gCurrent;
-}
-#endif
+static NimBLEServer*         pServer  = nullptr;
+static NimBLECharacteristic* pTxChar  = nullptr;
 
 // =============================================================
-//  Lees sensoren
+//  CAN-bus initialisatie
 // =============================================================
-static void readSensors() {
+static bool canInit() {
+    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+    // LISTEN_ONLY = leest alleen, verstuurt geen ACK → veilig op OBD2-poort
+    // Verander naar TWAI_MODE_NORMAL als je ook wil schrijven (relais via CAN)
+
+    twai_timing_config_t  t = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    if (twai_driver_install(&g, &t, &f) != ESP_OK) return false;
+    if (twai_start() != ESP_OK) return false;
+    return true;
+}
+
+// =============================================================
+//  CAN frame verwerking
+// =============================================================
+static void processCanFrame(uint32_t id, uint8_t* d, uint8_t len) {
+    gLastCanMsg = millis();
+    gCanOk = true;
+
+    switch (id) {
+
+        case CAN_ID_SOC:
+            if (len >= 1) {
+                gSoc   = d[0] & 0x3F;        // bits 5:0 = SoC%
+                gReady = (d[0] >> 6) & 0x01;  // bit 6 = contactsleutel aan
+            }
+            break;
+
+        case CAN_ID_BATT:
+            if (len >= 4) {
+                // Stroom: int16 big-endian, schaal 0.25A
+                int16_t raw_i = (int16_t)((d[0] << 8) | d[1]);
+                gCurrent = raw_i * 0.25f;
+
+                // Spanning: uint16 big-endian, schaal 0.5V
+                uint16_t raw_v = ((uint16_t)d[2] << 8) | d[3];
+                gVoltage = raw_v * 0.5f;
+
+                gPower = gVoltage * gCurrent;
+            }
+            break;
+
+        case CAN_ID_SPEED:
+            if (len >= 2) {
+                uint16_t raw = ((uint16_t)(d[1] & 0x0F) << 8) | d[0];
+                gSpeed = raw * 0.01f * 3.6f;  // m/s → km/h
+            }
+            break;
+
+        case CAN_ID_TEMP:
+            if (len >= 1) {
+                gTemp = (int)d[0] - 40;
+            }
+            break;
+
+        default:
+            // Sniffer: print onbekende frames op Serial voor debugging
+            // Verwijder commentaar om alle frames te zien:
+            // Serial.printf("CAN 0x%03X [%d]:", id, len);
+            // for (int i = 0; i < len; i++) Serial.printf(" %02X", d[i]);
+            // Serial.println();
+            break;
+    }
+}
+
+// =============================================================
+//  Demo modus — gesimuleerde waarden
+// =============================================================
 #if SENSOR_MODE == MODE_DEMO
-    // Gesimuleerde waarden die langzaam variëren
+static void updateDemo() {
     static float phase = 0;
     phase += 0.05f;
     gVoltage = 52.0f + 2.0f * sinf(phase * 0.3f);
-    gCurrent = 8.0f + 4.0f * sinf(phase);
+    gCurrent = -(8.0f + 4.0f * sinf(phase));   // negatief = ontladen
     gPower   = gVoltage * gCurrent;
-
-#elif SENSOR_MODE == MODE_INA226
-    ina226_read_all();
-
-#elif SENSOR_MODE == MODE_ADC
-    // Spanning via spanningsdeler
-    int raw_v = analogRead(VOLT_PIN);
-    gVoltage  = (raw_v / 4095.0f) * 3.3f * VOLT_RATIO;
-
-    // Stroom via ACS sensor
-    int raw_i  = analogRead(CURR_PIN);
-    float mv   = (raw_i / 4095.0f) * 3300.0f;
-    gCurrent   = (mv / 1000.0f - CURR_OFFSET) / (CURR_SENS / 1000.0f);
-    gPower     = gVoltage * gCurrent;
-#endif
-
-    // SoC lineaire benadering op basis van spanning
-    float ratio = (gVoltage - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V);
-    gSoc = (int)constrain(ratio * 100.0f, 0.0f, 100.0f);
+    gSoc     = 75;
+    gSpeed   = 30.0f + 10.0f * sinf(phase * 0.2f);
+    gReady   = true;
+    gCanOk   = true;
 }
+#endif
 
 // =============================================================
 //  Scherm update
@@ -136,37 +167,44 @@ static void readSensors() {
 static void updateDisplay() {
     auto& lcd = M5.Display;
     lcd.fillScreen(TFT_BLACK);
-    lcd.setTextColor(TFT_WHITE);
 
-    // Titel
+    // Statusbalk
     lcd.setTextSize(1);
     lcd.setCursor(2, 2);
-    lcd.setTextColor(gConnected ? TFT_GREEN : TFT_RED);
-    lcd.printf("%s  %s", DEVICE_NAME, gConnected ? "BT OK" : "wacht...");
+    lcd.setTextColor(gBleConnected ? TFT_GREEN : TFT_ORANGE);
+    lcd.printf("BT:%s", gBleConnected ? "OK" : "--");
+    lcd.setTextColor(gCanOk ? TFT_GREEN : TFT_RED);
+    lcd.printf("  CAN:%s", gCanOk ? "OK" : "GEEN");
+    lcd.setTextColor(TFT_WHITE);
+    lcd.printf("  %s", gReady ? "AAN" : "UIT");
 
-    // Metingen
+    // Spanning + Stroom
     lcd.setTextColor(TFT_CYAN);
     lcd.setTextSize(2);
-    lcd.setCursor(2, 22);
+    lcd.setCursor(2, 20);
     lcd.printf("%.1fV", gVoltage);
+    lcd.setCursor(85, 20);
+    // Stroom: negatief = ontladen (normaal rijden), positief = laden
+    lcd.printf("%.1fA", fabsf(gCurrent));
 
-    lcd.setCursor(80, 22);
-    lcd.printf("%.1fA", gCurrent);
-
+    // Vermogen + SoC
     lcd.setTextColor(TFT_YELLOW);
-    lcd.setCursor(2, 50);
-    lcd.printf("%.0fW", gPower);
+    lcd.setCursor(2, 47);
+    lcd.printf("%.0fW", fabsf(gPower));
 
-    // SoC met kleur
-    uint16_t socColor = gSoc > 50 ? TFT_GREEN : (gSoc > 20 ? TFT_YELLOW : TFT_RED);
+    uint16_t socColor = gSoc > 40 ? TFT_GREEN : (gSoc > 15 ? TFT_YELLOW : TFT_RED);
     lcd.setTextColor(socColor);
-    lcd.setCursor(80, 50);
+    lcd.setCursor(85, 47);
     lcd.printf("%d%%", gSoc);
 
-    // Relais status
-    lcd.setTextSize(1);
+    // Snelheid + temperatuur
     lcd.setTextColor(TFT_WHITE);
-    lcd.setCursor(2, 80);
+    lcd.setTextSize(1);
+    lcd.setCursor(2, 75);
+    lcd.printf("%.0f km/h   %d C", gSpeed, gTemp);
+
+    // Relais
+    lcd.setCursor(2, 88);
     lcd.printf("R1:%s  R2:%s",
         gRelay1 ? "AAN" : "UIT",
         gRelay2 ? "AAN" : "UIT");
@@ -176,11 +214,9 @@ static void updateDisplay() {
 //  BLE callbacks
 // =============================================================
 class ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* s) override {
-        gConnected = true;
-    }
-    void onDisconnect(NimBLEServer* s) override {
-        gConnected = false;
+    void onConnect(NimBLEServer*) override    { gBleConnected = true;  }
+    void onDisconnect(NimBLEServer*) override {
+        gBleConnected = false;
         NimBLEDevice::startAdvertising();
     }
 };
@@ -189,14 +225,11 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* c) override {
         std::string raw = c->getValue();
         if (raw.empty()) return;
-
         JsonDocument doc;
         if (deserializeJson(doc, raw) != DeserializationError::Ok) return;
-
         const char* cmd = doc["cmd"];
-        bool val        = doc["val"];
+        bool val = doc["val"];
         if (!cmd) return;
-
         if (strcmp(cmd, "r1") == 0) {
             gRelay1 = val;
             digitalWrite(RELAY1_PIN, val ? HIGH : LOW);
@@ -218,16 +251,13 @@ static void setupBle() {
     pServer->setCallbacks(new ServerCallbacks());
 
     NimBLEService* svc = pServer->createService(NUS_SERVICE);
-
-    pTxChar = svc->createCharacteristic(NUS_TX_CHAR,
-        NIMBLE_PROPERTY::NOTIFY);
+    pTxChar = svc->createCharacteristic(NUS_TX_CHAR, NIMBLE_PROPERTY::NOTIFY);
 
     NimBLECharacteristic* pRxChar = svc->createCharacteristic(NUS_RX_CHAR,
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
     pRxChar->setCallbacks(new RxCallbacks());
 
     svc->start();
-
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(NUS_SERVICE);
     adv->setScanResponse(true);
@@ -235,58 +265,69 @@ static void setupBle() {
 }
 
 // =============================================================
-//  Stuur JSON naar app
+//  Stuur JSON naar Android app
 // =============================================================
 static void sendJson() {
-    if (!gConnected || !pTxChar) return;
-
-    char buf[96];
+    if (!gBleConnected || !pTxChar) return;
+    char buf[128];
     snprintf(buf, sizeof(buf),
-        "{\"v\":%.2f,\"i\":%.2f,\"p\":%.1f,\"soc\":%d,\"r1\":%s,\"r2\":%s}",
+        "{\"v\":%.2f,\"i\":%.2f,\"p\":%.1f,\"soc\":%d"
+        ",\"spd\":%.1f,\"tmp\":%d,\"r1\":%s,\"r2\":%s}",
         gVoltage, gCurrent, gPower, gSoc,
+        gSpeed, gTemp,
         gRelay1 ? "true" : "false",
         gRelay2 ? "true" : "false");
-
     pTxChar->setValue((uint8_t*)buf, strlen(buf));
     pTxChar->notify();
 }
 
 // =============================================================
-//  Arduino setup / loop
+//  Setup
 // =============================================================
 void setup() {
+    Serial.begin(115200);
+
     auto cfg = M5.config();
     M5.begin(cfg);
-
-    M5.Display.setRotation(3);   // Liggend
+    M5.Display.setRotation(3);
     M5.Display.setBrightness(80);
     M5.Display.setTextFont(1);
-
     M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.setCursor(10, 40);
+    M5.Display.setCursor(5, 35);
     M5.Display.print("Twizy PowerBox");
-    M5.Display.setCursor(10, 60);
-    M5.Display.print("BLE opstarten...");
+    M5.Display.setCursor(5, 55);
+    M5.Display.print("Opstarten...");
 
     pinMode(RELAY1_PIN, OUTPUT);
     pinMode(RELAY2_PIN, OUTPUT);
     digitalWrite(RELAY1_PIN, LOW);
     digitalWrite(RELAY2_PIN, LOW);
 
-#if SENSOR_MODE == MODE_INA226
-    ina226_init();
-#elif SENSOR_MODE == MODE_ADC
-    analogSetAttenuation(ADC_11db);
-    analogSetWidth(12);
+#if SENSOR_MODE == MODE_CAN
+    M5.Display.setCursor(5, 70);
+    if (canInit()) {
+        M5.Display.setTextColor(TFT_GREEN);
+        M5.Display.print("CAN: OK (500kbps)");
+        Serial.println("CAN geinitialiseerd op 500kbps");
+    } else {
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.print("CAN: FOUT!");
+        Serial.println("CAN initialisatie mislukt - controleer bedrading");
+    }
+#else
+    M5.Display.setCursor(5, 70);
+    M5.Display.setTextColor(TFT_YELLOW);
+    M5.Display.print("DEMO modus");
 #endif
 
     setupBle();
-
-    Serial.begin(115200);
-    Serial.println("Twizy PowerBox gestart");
+    delay(1000);
 }
 
+// =============================================================
+//  Loop
+// =============================================================
 void loop() {
     M5.update();
 
@@ -294,18 +335,36 @@ void loop() {
     if (M5.BtnA.wasPressed()) {
         gRelay1 = !gRelay1;
         digitalWrite(RELAY1_PIN, gRelay1 ? HIGH : LOW);
+        Serial.printf("Relais 1: %s\n", gRelay1 ? "AAN" : "UIT");
     }
-
     // Button B — toggle relais 2
     if (M5.BtnB.wasPressed()) {
         gRelay2 = !gRelay2;
         digitalWrite(RELAY2_PIN, gRelay2 ? HIGH : LOW);
+        Serial.printf("Relais 2: %s\n", gRelay2 ? "AAN" : "UIT");
     }
 
-    // Lees sensoren en stuur data elke 500ms
+#if SENSOR_MODE == MODE_CAN
+    // Lees beschikbare CAN frames (non-blocking)
+    twai_message_t msg;
+    while (twai_receive(&msg, 0) == ESP_OK) {
+        if (!(msg.flags & TWAI_MSG_FLAG_EXTD)) {   // alleen standaard 11-bit
+            processCanFrame(msg.identifier, msg.data, msg.data_length_code);
+        }
+    }
+    // CAN time-out detectie (geen frames > 3s = contact uit of fout)
+    if (gCanOk && (millis() - gLastCanMsg > 3000)) {
+        gCanOk  = false;
+        gReady  = false;
+        gSpeed  = 0;
+    }
+#else
+    updateDemo();
+#endif
+
+    // Stuur data elke 500ms
     if (millis() - gLastSend >= 500) {
         gLastSend = millis();
-        readSensors();
         updateDisplay();
         sendJson();
     }
