@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Twizy PowerBox</string>
+    <string name="dashboard_title">Dashboard</string>
+
+    <!-- Main Activity -->
+    <string name="tap_scan">Tap the scan button to find devices</string>
+    <string name="scanning">Scanning for BLE devices…</string>
+    <string name="scan_fab_description">Scan for Bluetooth devices</string>
+    <string name="permissions_required">Bluetooth permissions are required to scan for devices</string>
+
+    <!-- Dashboard status -->
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_scanning">Scanning…</string>
+    <string name="status_disconnected">Disconnected</string>
+
+    <!-- Section headers -->
+    <string name="section_metrics">Live Metrics</string>
+    <string name="section_relays">Relay Control</string>
+
+    <!-- Metric labels -->
+    <string name="label_voltage">Voltage</string>
+    <string name="label_current">Current</string>
+    <string name="label_power">Power</string>
+    <string name="label_soc">State of Charge</string>
+    <string name="label_relay1">Relay 1</string>
+    <string name="label_relay2">Relay 2</string>
+
+    <!-- Units -->
+    <string name="unit_voltage">Volts (V)</string>
+    <string name="unit_current">Amperes (A)</string>
+    <string name="unit_power">Watts (W)</string>
+
+    <!-- Default values -->
+    <string name="default_voltage">--.-</string>
+    <string name="default_current">--.-</string>
+    <string name="default_power">---</string>
+    <string name="default_soc">--</string>
+
+    <!-- Format strings -->
+    <string name="format_voltage">%.1f</string>
+    <string name="format_current">%.1f</string>
+    <string name="format_power">%.0f</string>
+    <string name="format_soc">%d%%</string>
+
+    <!-- Relay descriptions -->
+    <string name="relay1_description">Auxiliary output 1</string>
+    <string name="relay2_description">Auxiliary output 2</string>
+</resources>
